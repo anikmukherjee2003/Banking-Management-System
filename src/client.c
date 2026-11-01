@@ -318,11 +318,12 @@ static int administrator_menu(int fd) {
     /*
      * Administrator menu. Creating an employee means choosing employee as the
      * role in USER_ADD; role and detail permissions are checked again server-side.
-     * Choice map: 1 USER_ADD, 2 USER_MODIFY, 3 ROLE_SET.
+     * Choice map: 1 USER_ADD, 2 USER_MODIFY, 3 ROLE_SET,
+     * 4 FRAUD_LIST, 5 FRAUD_RESOLVE.
      */
-    char choice[32], username[64], password[129], name[128], email[180], phone[80], role[32];
+    char choice[32], username[64], password[129], name[128], email[180], phone[80], role[32], alert_id[32];
     for (;;) {
-        puts("\nADMINISTRATOR MENU\n1. Create user account\n2. Modify customer or employee details\n3. Manage user role\n4. Change password\n5. Sign out\n0. Exit");
+        puts("\nADMINISTRATOR MENU\n1. Create user account\n2. Modify customer or employee details\n3. Manage user role\n4. Review fraud alerts\n5. Resolve fraud alert\n6. Change password\n7. Sign out\n0. Exit");
         if (read_field("Choose: ", choice, sizeof(choice), 0)) return MENU_EXIT;
         if (!strcmp(choice, "1")) {
             if (read_field("Role (customer/employee/manager/administrator): ", role, sizeof(role), 0) ||
@@ -343,8 +344,12 @@ static int administrator_menu(int fd) {
             if (!read_field("Username: ", username, sizeof(username), 0) &&
                 !read_field("Role (customer/employee/manager/administrator): ", role, sizeof(role), 0))
                 send_request(fd, NULL, 0, "ROLE_SET|%s|%s", username, role);
-        } else if (!strcmp(choice, "4")) change_password(fd);
-        else if (!strcmp(choice, "5")) { send_request(fd, NULL, 0, "LOGOUT"); return MENU_LOGOUT; }
+        } else if (!strcmp(choice, "4")) send_request(fd, NULL, 0, "FRAUD_LIST");
+        else if (!strcmp(choice, "5")) {
+            if (!read_field("Fraud alert ID to resolve: ", alert_id, sizeof(alert_id), 0))
+                send_request(fd, NULL, 0, "FRAUD_RESOLVE|%s", alert_id);
+        } else if (!strcmp(choice, "6")) change_password(fd);
+        else if (!strcmp(choice, "7")) { send_request(fd, NULL, 0, "LOGOUT"); return MENU_LOGOUT; }
         else if (!strcmp(choice, "0")) { send_request(fd, NULL, 0, "LOGOUT"); return MENU_EXIT; }
         else puts("Choose one of the displayed options.");
     }

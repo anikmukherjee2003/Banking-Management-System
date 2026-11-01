@@ -15,6 +15,7 @@
 #define BANK_MAX_TRANSACTIONS 4096
 #define BANK_MAX_LOANS 512
 #define BANK_MAX_FEEDBACK 512
+#define BANK_MAX_FRAUD_ALERTS 1024
 #define BANK_MAX_SESSIONS 128
 #define BANK_REQUEST_MAX 8192
 #define BANK_RESPONSE_MAX 65536
@@ -80,6 +81,19 @@ typedef struct {
     long long created_at; /* Submission time, Unix seconds. */
 } BankFeedback;
 
+/* Persistent fraud signal; hold_applied records which alerts caused a hold. */
+typedef struct {
+    char id[20];
+    char username[33];
+    char reason[40];
+    char details[241];
+    int hold_applied;
+    int reviewed;
+    long long created_at;
+    char reviewed_by[33];
+    long long reviewed_at;
+} BankFraudAlert;
+
 /*
  * Session metadata lives in bank.db so separate forked workers can enforce the
  * one-session rule. The random token ties a socket thread to this exact record.
@@ -101,17 +115,20 @@ typedef struct {
     int next_transaction;
     int next_loan;
     int next_feedback;
+    int next_fraud_alert;
     size_t user_count;
     size_t account_count;
     size_t transaction_count;
     size_t loan_count;
     size_t feedback_count;
+    size_t fraud_alert_count;
     size_t session_count;
     BankUser users[BANK_MAX_USERS];
     BankAccount accounts[BANK_MAX_USERS];
     BankTransaction transactions[BANK_MAX_TRANSACTIONS];
     BankLoan loans[BANK_MAX_LOANS];
     BankFeedback feedback[BANK_MAX_FEEDBACK];
+    BankFraudAlert fraud_alerts[BANK_MAX_FRAUD_ALERTS];
     BankSessionRecord sessions[BANK_MAX_SESSIONS];
 } BankState;
 

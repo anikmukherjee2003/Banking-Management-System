@@ -87,6 +87,16 @@ classDiagram
         +reviewed
         +timestamp
     }
+    class FraudAlert {
+        +alertId
+        +customer
+        +reason
+        +details
+        +holdApplied
+        +reviewedBy
+        +createdAt
+        +reviewedAt
+    }
     class Session {
         +token
         +workerPid
@@ -102,6 +112,7 @@ classDiagram
     Customer "1" --> "0..*" LoanApplication : submits
     Employee "0..1" --> "0..*" LoanApplication : processes
     Customer "1" --> "0..*" Feedback : writes
+    Customer "1" --> "0..*" FraudAlert : triggers
     User "1" --> "0..1" Session : holds
 ```
 
@@ -113,12 +124,13 @@ The role types in this conceptual diagram are stored as role values in C user re
 
 | Record | Fields | Purpose |
 | --- | --- | --- |
-| `META` | next account, transaction, loan, and feedback IDs | ID generation. |
+| `META` | next account, transaction, loan, feedback, and fraud alert IDs | ID generation. The loader accepts the older four-ID format too. |
 | `USER` | username, salt, password hash, role, active flag, contact details | Credentials and permissions. |
-| `ACCOUNT` | username, account number, balance, status (`ACTIVE`, `INACTIVE`, or `CLOSED`) | Customer account state. |
+| `ACCOUNT` | username, account number, balance, status (`ACTIVE`, `INACTIVE`, `CLOSED`, or `FRAUD_HOLD`) | Customer account state. A fraud hold is released through administrator alert review. |
 | `TX` | ID, owner, type, amount, balance after, related account, reference, time, memo | Passbook and audit trail. |
 | `LOAN` | ID, applicant, amount, purpose, status, assignee, reviewer, timestamps | Loan processing workflow. |
 | `FEEDBACK` | ID, customer, message, reviewed flag, timestamp | Customer feedback. |
+| `FRAUD` | ID, customer, reason, details, hold flag, reviewed flag, creation time, reviewer, review time | Persistent fraud alert history and account hold audit. |
 | `SESSION` | username, random token, worker PID, last activity | One active login per user. |
 
 ## Transaction sequence
@@ -144,6 +156,8 @@ sequenceDiagram
     Thread-->>Client: Response lines
 ```
 
+Fraud checks run inside the same locked operation before a suspicious transfer is posted. A transfer of Rs 100,000 or more, or the third outgoing transfer within five minutes, is blocked and creates a hold alert. Three insufficient-funds transfers or withdrawals within ten minutes create a hold. The attempt and alert are saved through the regular snapshot commit path. An administrator can list alerts and resolve them; the account returns to `ACTIVE` only after all its open hold-causing alerts have been reviewed.
+
 ## Requirement mapping
 
 | Requirement from the project brief | C implementation |
@@ -156,3 +170,4 @@ sequenceDiagram
 | One session per user | Session records and random tokens are stored in the database and checked on each request. |
 | ACID-oriented updates | One critical section validates and changes the state; a complete replacement file is synced and atomically renamed into place. |
 | Roles and modules | Customer, employee, manager, and administrator operations are enforced by server-side role checks. |
+| Rule-based fraud review | Transfer amount, recent transfer velocity, and repeated insufficient-funds attempts create saved alerts and administrator-reviewed account holds. |

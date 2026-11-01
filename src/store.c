@@ -26,6 +26,11 @@
 #define PASSWORD_ROUNDS 120000
 #define SESSION_LIFETIME (12 * 60 * 60)
 #define MAX_AMOUNT_PAISE 100000000000LL
+#define FRAUD_LARGE_TRANSFER_PAISE 10000000LL
+#define FRAUD_TRANSFER_WINDOW_SECONDS (5 * 60)
+#define FRAUD_FAILURE_WINDOW_SECONDS (10 * 60)
+#define FRAUD_TRANSFER_BURST_LIMIT 2
+#define FRAUD_FAILED_TRANSFER_LIMIT 2
 
 /*
  * This module is the authoritative banking layer. The client sends commands,
@@ -63,6 +68,7 @@ static void state_reset(BankState *state) {
     state->next_transaction = 1;
     state->next_loan = 1;
     state->next_feedback = 1;
+    state->next_fraud_alert = 1;
 }
 
 static int response_line(BankResponse *response, const char *format, ...) {
@@ -317,7 +323,8 @@ static BankUser *add_user(BankState *state, const char *username_source, const c
 static int add_transaction(BankState *state, const char *username, const char *type,
                            long long amount, const char *related, const char *reference,
                            const char *memo, BankTransaction **created);
-
+//difference between load_database_record and load_database is that load_database_record is a helper function that processes a single line of the database file, while load_database reads the entire database file and calls load_database_record for each line.
+//difference between load_database_record and save_database is that load_database_record reads a single line from the database file and populates the BankState structure with the corresponding data, while save_database writes the entire BankState structure to a new temporary file in a specific format and then renames it to replace the old database file.
 static int load_database_record(BankState *state, char *line) {
     /*
      * Decode one pipe-separated database row. Record tags are META, USER,
@@ -328,14 +335,17 @@ static int load_database_record(BankState *state, char *line) {
     char *fields[16];
     int count = split_fields(line, fields, 16);
     if (count <= 0) return -1;
-    /* META stores the next IDs, so identifiers stay unique after restart. */
-    if (strcmp(fields[0], "META") == 0 && count == 5) {
-        long long values[4];
-        for (int i = 0; i < 4; i++) if (parse_long_long(fields[i + 1], &values[i]) != 0) return -1;
+    /* META stores next IDs. Count 5 is the legacy format without fraud IDs. */
+    //META|next_account|next_transaction|next_loan|next_feedback|next_fraud_alert
+    if (strcmp(fields[0], "META") == 0 && (count == 5 || count == 6)) {
+        long long values[5] = {0, 0, 0, 0, 1};
+        int value_count = count - 1;
+        for (int i = 0; i < value_count; i++) if (parse_long_long(fields[i + 1], &values[i]) != 0) return -1;
         state->next_account = (int)values[0];
         state->next_transaction = (int)values[1];
         state->next_loan = (int)values[2];
         state->next_feedback = (int)values[3];
+        state->next_fraud_alert = (int)values[4];
     /* Each following tag reconstructs one typed record in the snapshot. */
     } else if (strcmp(fields[0], "USER") == 0 && count == 9 && state->user_count < BANK_MAX_USERS) {
         BankUser *item = &state->users[state->user_count++];
@@ -365,7 +375,8 @@ static int load_database_record(BankState *state, char *line) {
             copy_field(item->related_account, sizeof(item->related_account), fields[6], 1) ||
             copy_field(item->reference, sizeof(item->reference), fields[7], 1) ||
             parse_long_long(fields[8], &item->created_at) ||
-            copy_field(item->memo, sizeof(item->memo), fields[9], 1)) return -1;
+            copy_field(item->memo, sizeof(item->memo), fields[9], 1)) return -1;//this if condition checks if any of the copy_field or parse_long_long functions return a non-zero value, indicating an error in copying or parsing the respective fields. If any of these functions fail, the function returns -1 to indicate an error in loading the database record.
+            
     } else if (strcmp(fields[0], "LOAN") == 0 && count == 10 && state->loan_count < BANK_MAX_LOANS) {
         BankLoan *item = &state->loans[state->loan_count++];
         if (copy_field(item->id, sizeof(item->id), fields[1], 0) ||
@@ -384,6 +395,19 @@ static int load_database_record(BankState *state, char *line) {
             copy_field(item->username, sizeof(item->username), fields[2], 0) ||
             copy_field(item->message, sizeof(item->message), fields[3], 0) ||
             parse_long_long(fields[4], &reviewed) || parse_long_long(fields[5], &item->created_at)) return -1;
+        item->reviewed = reviewed != 0;
+    } else if (strcmp(fields[0], "FRAUD") == 0 && count == 10 && state->fraud_alert_count < BANK_MAX_FRAUD_ALERTS) {
+        BankFraudAlert *item = &state->fraud_alerts[state->fraud_alert_count++];
+        long long hold = 0, reviewed = 0;
+        if (copy_field(item->id, sizeof(item->id), fields[1], 0) ||
+            copy_field(item->username, sizeof(item->username), fields[2], 0) ||
+            copy_field(item->reason, sizeof(item->reason), fields[3], 0) ||
+            copy_field(item->details, sizeof(item->details), fields[4], 1) ||
+            parse_long_long(fields[5], &hold) || parse_long_long(fields[6], &reviewed) ||
+            parse_long_long(fields[7], &item->created_at) ||
+            copy_field(item->reviewed_by, sizeof(item->reviewed_by), fields[8], 1) ||
+            parse_long_long(fields[9], &item->reviewed_at)) return -1;
+        item->hold_applied = hold != 0;
         item->reviewed = reviewed != 0;
     } else if (strcmp(fields[0], "SESSION") == 0 && count == 5 && state->session_count < BANK_MAX_SESSIONS) {
         BankSessionRecord *item = &state->sessions[state->session_count++];
@@ -447,7 +471,7 @@ static int load_database(const char *path, BankState *state) {
     return result;
 }
 
-static int save_database(const char *data_dir, const char *path, const BankState *state) {
+static int save_database(const char *data_dir, const char *path, const BankState *state) {//With the temporary-file-and-rename approach, the database path points to either the old complete snapshot or the new complete snapshot, rather than a partially written snapshot.
     /*
      * Serialize to a unique file in the same directory, sync its contents, then
      * rename it over the database. Same-directory rename makes readers observe
@@ -455,6 +479,8 @@ static int save_database(const char *data_dir, const char *path, const BankState
      * partially written database. Syncing the directory strengthens durability
      * by persisting the rename metadata after the file contents have been synced.
      */
+    //why fsync() on tempo file and then on directory? Because fsync() on the temporary file ensures that all the data written to the file is flushed to disk, making it durable. After renaming the temporary file to replace the old database, fsync() on the directory ensures that the rename operation itself is also persisted to disk, preventing potential data loss in case of a crash or power failure.
+    
     /* A unique temporary filename avoids colliding with another writer's scratch file. */
     char temporary[PATH_MAX];
     struct timespec now;
@@ -471,7 +497,8 @@ static int save_database(const char *data_dir, const char *path, const BankState
     if (failed) goto save_done; \
 } while (0)
     /* Write records in a fixed format that load_database_record() understands. */
-    WRITE_LINE("META|%d|%d|%d|%d\n", state->next_account, state->next_transaction, state->next_loan, state->next_feedback);
+    WRITE_LINE("META|%d|%d|%d|%d|%d\n", state->next_account, state->next_transaction, state->next_loan,
+               state->next_feedback, state->next_fraud_alert);
     for (size_t i = 0; i < state->user_count; i++) {
         const BankUser *item = &state->users[i];
         WRITE_LINE("USER|%s|%s|%s|%s|%d|%s|%s|%s\n", item->username, item->salt_hex, item->password_hash,
@@ -497,6 +524,12 @@ static int save_database(const char *data_dir, const char *path, const BankState
         const BankFeedback *item = &state->feedback[i];
         WRITE_LINE("FEEDBACK|%s|%s|%s|%d|%lld\n", item->id, item->username, item->message,
                    item->reviewed, item->created_at);
+    }
+    for (size_t i = 0; i < state->fraud_alert_count; i++) {
+        const BankFraudAlert *item = &state->fraud_alerts[i];
+        WRITE_LINE("FRAUD|%s|%s|%s|%s|%d|%d|%lld|%s|%lld\n", item->id, item->username,
+                   item->reason, item->details, item->hold_applied, item->reviewed,
+                   item->created_at, item->reviewed_by, item->reviewed_at);
     }
     for (size_t i = 0; i < state->session_count; i++) {
         const BankSessionRecord *item = &state->sessions[i];
@@ -528,6 +561,7 @@ static int lock_database(BankStore *store, int *lock_fd) {
      * flock() on a stable sidecar file also coordinates a second server process
      * pointed at the same data directory (each process has its own semaphore).
      */
+     //it means
     while (sem_wait(store->database_semaphore) != 0) if (errno != EINTR) return -1;
     *lock_fd = open(store->lock_path, O_CREAT | O_RDWR, 0600);
     if (*lock_fd < 0) { sem_post(store->database_semaphore); return -1; }
@@ -765,6 +799,13 @@ static int create_session_token(char token[65]) {
 }
 
 static int login_operation(BankState *state, void *argument) {
+    //state has the current database snapshot, and argument is a RequestContext pointer.
+    //struct RequestContext {
+    //    BankResponse *response;
+    //    char **fields;
+    //    size_t count;
+    //    BankSession *session;
+    //};
     /*
      * Expire stale records, authenticate the user, enforce one active session,
      * and save a random session token tied to the worker process.
@@ -778,6 +819,7 @@ static int login_operation(BankState *state, void *argument) {
         response_error(response, "Invalid username or password.");
         return 0;
     }
+
     /* Remove expired sessions in-place; do not increment after shifting a row left. */
     long long now = (long long)time(NULL);
     for (size_t i = 0; i < state->session_count;) {
@@ -792,6 +834,10 @@ static int login_operation(BankState *state, void *argument) {
         return 1;
     }
     BankAccount *account = find_account(state, username);
+    if (role_is(user, "customer") && account && !strcmp(account->status, "FRAUD_HOLD")) {
+        response_error(response, "This customer account is temporarily held for administrator review.");
+        return 1;
+    }
     if (role_is(user, "customer") && (!account || strcmp(account->status, "ACTIVE") != 0)) {
         response_error(response, "This customer account is inactive. Contact a bank manager.");
         return 1;
@@ -813,9 +859,11 @@ static int login_operation(BankState *state, void *argument) {
         return 1;
     }
     snprintf(record->username, sizeof(record->username), "%s", username);
+    //stored in bank.db
     record->worker_pid = getpid();
     record->last_seen = now;
     state->session_count++;
+    //update connection local session, held by client thread
     context->session->authenticated = 1;
     snprintf(context->session->username, sizeof(context->session->username), "%s", username);
     snprintf(context->session->token, sizeof(context->session->token), "%s", record->token);
@@ -896,6 +944,79 @@ static int add_feedback(BankState *state, const char *username, const char *mess
     return 0;
 }
 
+static BankFraudAlert *find_fraud_alert(BankState *state, const char *id) {
+    for (size_t i = 0; i < state->fraud_alert_count; i++)
+        if (!strcmp(state->fraud_alerts[i].id, id)) return &state->fraud_alerts[i];
+    return NULL;
+}
+
+static BankFraudAlert *add_fraud_alert(BankState *state, const char *username,
+                                       const char *reason, const char *details,
+                                       int hold_applied) {
+    if (state->fraud_alert_count >= BANK_MAX_FRAUD_ALERTS) return NULL;
+    BankFraudAlert *alert = &state->fraud_alerts[state->fraud_alert_count];
+    memset(alert, 0, sizeof(*alert));
+    snprintf(alert->id, sizeof(alert->id), "FA%07d", state->next_fraud_alert++);
+    if (copy_field(alert->username, sizeof(alert->username), username, 0) ||
+        copy_field(alert->reason, sizeof(alert->reason), reason, 0) ||
+        copy_field(alert->details, sizeof(alert->details), details, 1)) return NULL;
+    alert->hold_applied = hold_applied != 0;
+    alert->created_at = (long long)time(NULL);
+    state->fraud_alert_count++;
+    return alert;
+}
+
+static size_t recent_failed_attempts(const BankState *state, const char *username,
+                                    long long cutoff) {
+    size_t count = 0;
+    for (size_t i = 0; i < state->fraud_alert_count; i++) {
+        const BankFraudAlert *alert = &state->fraud_alerts[i];
+        if (strcmp(alert->username, username) || alert->created_at < cutoff) continue;
+        if (!strcmp(alert->reason, "FAILED_TRANSFER_ATTEMPT") ||
+            !strcmp(alert->reason, "FAILED_WITHDRAWAL_ATTEMPT") ||
+            !strcmp(alert->reason, "REPEATED_FAILED_TRANSACTIONS")) count++;
+    }
+    return count;
+}
+
+static size_t recent_outgoing_transfers(const BankState *state, const char *username,
+                                        long long cutoff) {
+    size_t count = 0;
+    for (size_t i = 0; i < state->transaction_count; i++) {
+        const BankTransaction *item = &state->transactions[i];
+        if (!strcmp(item->username, username) && !strcmp(item->type, "TRANSFER_OUT") &&
+            item->created_at >= cutoff) count++;
+    }
+    return count;
+}
+
+static void fraud_alert_row(BankResponse *response, const BankFraudAlert *alert) {
+    response_line(response, "ROW|%s|%s|%s|%s|%s|%d|%lld|%s|%lld\n",
+                  alert->id, alert->username, alert->reason, alert->details,
+                  alert->reviewed ? "REVIEWED" : "OPEN", alert->hold_applied,
+                  alert->created_at, alert->reviewed_by, alert->reviewed_at);
+}
+
+static int set_fraud_hold(BankAccount *account, BankState *state, const char *reason,
+                          const char *details) {
+    /* Persist the alert before applying its hold so every hold has an audit record. */
+    if (!add_fraud_alert(state, account->username, reason, details, 1)) return -1;
+    snprintf(account->status, sizeof(account->status), "FRAUD_HOLD");
+    return 0;
+}
+
+static int record_failed_transaction(BankState *state, BankAccount *account,
+                                     const char *reason, const char *details) {
+    long long now = (long long)time(NULL);
+    size_t previous = recent_failed_attempts(state, account->username,
+                                             now - FRAUD_FAILURE_WINDOW_SECONDS);
+    if (previous >= FRAUD_FAILED_TRANSFER_LIMIT) {
+        if (set_fraud_hold(account, state, "REPEATED_FAILED_TRANSACTIONS", details) != 0) return -1;
+        return 1;
+    }
+    return add_fraud_alert(state, account->username, reason, details, 0) ? 0 : -1;
+}
+
 static void dispatch_command(BankState *state, RequestContext *context, BankUser *user) {
     /*
      * Route an authenticated request only after the session gate has loaded the
@@ -932,7 +1053,19 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
         BankAccount *account = NULL;
         if (!account_active(state, user->username, &account)) { response_error(response, "This account is inactive."); return; }
         if (is_deposit && account->balance_paise > LLONG_MAX - amount) { response_error(response, "This deposit would exceed the account balance limit."); return; }
-        if (!is_deposit && account->balance_paise < amount) { response_error(response, "There are not enough funds for this withdrawal."); return; }
+        if (!is_deposit && account->balance_paise < amount) {
+            char amount_text[48], details[241];
+            format_money(amount, amount_text);
+            snprintf(details, sizeof(details), "Withdrawal request for Rs %s failed: insufficient funds.", amount_text);
+            int fraud_result = record_failed_transaction(state, account,
+                                                        "FAILED_WITHDRAWAL_ATTEMPT", details);
+            if (fraud_result < 0) { response_error(response, "Could not record the failed attempt for review."); return; }
+            if (fraud_result > 0) {
+                response_error(response, "Repeated failed transactions flagged this account for administrator review.");
+                return;
+            }
+            response_error(response, "There are not enough funds for this withdrawal."); return;
+        }
         if (state->transaction_count >= BANK_MAX_TRANSACTIONS) { response_error(response, "The transaction history limit has been reached."); return; }
         /* Balance and ledger entry are changed in the same locked snapshot. */
         account->balance_paise += is_deposit ? amount : -amount;
@@ -958,8 +1091,41 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
         if (!account_active(state, user->username, &sender) || !account_for_customer(state, username, &recipient)) {
             response_error(response, "An active customer destination account was not found."); return;
         }
-        if (sender->balance_paise < amount) { response_error(response, "There are not enough funds for this transfer."); return; }
+        if (amount >= FRAUD_LARGE_TRANSFER_PAISE) {
+            char amount_text[48], details[241];
+            format_money(amount, amount_text);
+            snprintf(details, sizeof(details), "Transfer request to %s for Rs %s exceeded the Rs 100000.00 review threshold.", username, amount_text);
+            if (set_fraud_hold(sender, state, "LARGE_TRANSFER", details) != 0) {
+                response_error(response, "Transfer blocked because a fraud alert could not be saved."); return;
+            }
+            response_error(response, "Transfer flagged for administrator review; funds were not moved.");
+            return;
+        }
+        if (sender->balance_paise < amount) {
+            char amount_text[48], details[241];
+            format_money(amount, amount_text);
+            snprintf(details, sizeof(details), "Transfer request to %s for Rs %s failed: insufficient funds.", username, amount_text);
+            int fraud_result = record_failed_transaction(state, sender,
+                                                        "FAILED_TRANSFER_ATTEMPT", details);
+            if (fraud_result < 0) { response_error(response, "Could not record the failed attempt for review."); return; }
+            if (fraud_result > 0) {
+                response_error(response, "Repeated failed transactions flagged this account for administrator review.");
+                return;
+            }
+            response_error(response, "There are not enough funds for this transfer."); return;
+        }
         if (recipient->balance_paise > LLONG_MAX - amount) { response_error(response, "This transfer would exceed the destination account balance limit."); return; }
+        if (recent_outgoing_transfers(state, user->username,
+                                      (long long)time(NULL) - FRAUD_TRANSFER_WINDOW_SECONDS) >= FRAUD_TRANSFER_BURST_LIMIT) {
+            char amount_text[48], details[241];
+            format_money(amount, amount_text);
+            snprintf(details, sizeof(details), "Transfer request to %s for Rs %s was the third outgoing transfer within five minutes.", username, amount_text);
+            if (set_fraud_hold(sender, state, "RAPID_TRANSFERS", details) != 0) {
+                response_error(response, "Transfer blocked because a fraud alert could not be saved."); return;
+            }
+            response_error(response, "Rapid transfers flagged this account for administrator review; funds were not moved.");
+            return;
+        }
         if (state->transaction_count + 2 > BANK_MAX_TRANSACTIONS) { response_error(response, "The transaction history limit has been reached."); return; }
         char reference[20];
         snprintf(reference, sizeof(reference), "TR%07d", state->next_transaction++);
@@ -1111,19 +1277,21 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
     /* LOAN_DECIDE|loan_id|approve-or-reject is restricted to its assigned employee. */
     if (strcmp(command, "LOAN_DECIDE") == 0) {
         if (expect_count(context, 3)) return;
+        //this is for employees to approve or reject a loan application assigned to them
         if (!role_is(user, "employee")) { response_error(response, "Only employees can process loan applications."); return; }
         char loan_id[20], decision[16];
         if (copy_field(loan_id, sizeof(loan_id), context->fields[1], 0) || copy_field(decision, sizeof(decision), context->fields[2], 0)) {
-            response_error(response, "Loan ID or decision is invalid."); return;
+            response_error(response, "Loan ID or decision is invalid."); return;//checking if the fields are valid and not empty
         }
-        for (char *p = decision; *p; p++) *p = (char)toupper((unsigned char)*p);
-        if (strcmp(decision, "APPROVE") && strcmp(decision, "REJECT")) { response_error(response, "Decision must be APPROVE or REJECT."); return; }
-        BankLoan *loan = find_loan(state, loan_id);
+        for (char *p = decision; *p; p++) *p = (char)toupper((unsigned char)*p);//convert decision to uppercase for case-insensitive comparison
+        if (strcmp(decision, "APPROVE") && strcmp(decision, "REJECT")) { response_error(response, "Decision must be APPROVE or REJECT."); return; }//if none matches, return error
+        BankLoan *loan = find_loan(state, loan_id);//from state find the loan with the given id //state is the current snapshot of the bank database
         if (!loan || strcmp(loan->assigned_to, user->username) || strcmp(loan->status, "ASSIGNED")) {
             response_error(response, "That application is not assigned to you or has already been processed."); return;
-        }
+        }//authorization check: the loan must be assigned to the current employee and must be in ASSIGNED status
         BankAccount *customer_account = NULL;
         if (!strcmp(decision, "APPROVE")) {
+            //if the decision is to approve the loan, check if the customer account is active and if the transaction history limit has been reached
             if (!account_active(state, loan->username, &customer_account)) { response_error(response, "The customer account is inactive; reactivate it before approval."); return; }
             if (state->transaction_count >= BANK_MAX_TRANSACTIONS) { response_error(response, "The transaction history limit has been reached."); return; }
             if (customer_account->balance_paise > LLONG_MAX - loan->amount_paise) { response_error(response, "This loan would exceed the customer account balance limit."); return; }
@@ -1134,11 +1302,16 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
                 response_error(response, "Could not record the loan disbursement."); return;
             }
             snprintf(loan->status, sizeof(loan->status), "APPROVED");
-        } else snprintf(loan->status, sizeof(loan->status), "REJECTED");
+        } 
+        
+        else {//if the decision is to reject the loan, simply update its status to REJECTED
+            snprintf(loan->status, sizeof(loan->status), "REJECTED");
+        }
         snprintf(loan->reviewed_by, sizeof(loan->reviewed_by), "%s", user->username);
         loan->reviewed_at = (long long)time(NULL);
         response_ok(response, "Loan decision saved.");
         response_line(response, "DATA|%s|%s\n", loan->id, loan->status);
+        
         return;
     }
 
@@ -1151,6 +1324,7 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
         BankAccount *account = find_account(state, username);
         if (!target || !role_is(target, "customer") || !account) { response_error(response, "Customer account was not found."); return; }
         if (!strcmp(account->status, "CLOSED")) { response_error(response, "A closed account cannot be reactivated or changed."); return; }
+        if (!strcmp(account->status, "FRAUD_HOLD")) { response_error(response, "A fraud hold can only be cleared by administrator alert review."); return; }
         char status[12];
         if (copy_field(status, sizeof(status), context->fields[2], 0)) { response_error(response, "Account status is invalid."); return; }
         for (char *p = status; *p; p++) *p = (char)toupper((unsigned char)*p);
@@ -1170,6 +1344,7 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
         BankAccount *account = find_account(state, username);
         if (!target || !role_is(target, "customer") || !account) { response_error(response, "Customer account was not found."); return; }
         if (!strcmp(account->status, "CLOSED")) { response_error(response, "This account is already closed."); return; }
+        if (!strcmp(account->status, "FRAUD_HOLD")) { response_error(response, "A fraud hold must be reviewed before this account can be closed."); return; }
         if (account->balance_paise != 0) { response_error(response, "The account balance must be zero before closure."); return; }
         for (size_t i = 0; i < state->loan_count; i++) {
             BankLoan *loan = &state->loans[i];
@@ -1199,6 +1374,54 @@ static void dispatch_command(BankState *state, RequestContext *context, BankUser
             response_line(response, "ROW|%s|%s|%lld|%s\n", item->id, item->username, item->created_at, item->message);
             shown++;
         }
+        return;
+    }
+
+    /* FRAUD_LIST shows recent alert history; only administrators may inspect it. */
+    if (strcmp(command, "FRAUD_LIST") == 0) {
+        if (expect_count(context, 1)) return;
+        if (!role_is(user, "administrator")) { response_error(response, "Only administrators can review fraud alerts."); return; }
+        response_ok(response, "Open fraud alerts first; reviewed history is shown when none remain open.");
+        size_t shown = 0;
+        for (size_t i = state->fraud_alert_count; i > 0 && shown < 100; i--) {
+            BankFraudAlert *alert = &state->fraud_alerts[i - 1];
+            if (!alert->reviewed) { fraud_alert_row(response, alert); shown++; }
+        }
+        if (shown == 0) {
+            for (size_t i = state->fraud_alert_count; i > 0 && shown < 100; i--) {
+                fraud_alert_row(response, &state->fraud_alerts[i - 1]);
+                shown++;
+            }
+        }
+        return;
+    }
+
+    /* FRAUD_RESOLVE|alert_id records the reviewer and releases holds with no open hold alert. */
+    if (strcmp(command, "FRAUD_RESOLVE") == 0) {
+        if (expect_count(context, 2)) return;
+        if (!role_is(user, "administrator")) { response_error(response, "Only administrators can resolve fraud alerts."); return; }
+        char alert_id[20];
+        if (copy_field(alert_id, sizeof(alert_id), context->fields[1], 0)) { response_error(response, "Fraud alert ID is invalid."); return; }
+        BankFraudAlert *alert = find_fraud_alert(state, alert_id);
+        if (!alert || alert->reviewed) { response_error(response, "That fraud alert was not found or is already reviewed."); return; }
+        alert->reviewed = 1;
+        snprintf(alert->reviewed_by, sizeof(alert->reviewed_by), "%s", user->username);
+        alert->reviewed_at = (long long)time(NULL);
+        BankAccount *account = find_account(state, alert->username);
+        if (account && !strcmp(account->status, "FRAUD_HOLD")) {
+            int open_hold_alert = 0;
+            for (size_t i = 0; i < state->fraud_alert_count; i++) {
+                BankFraudAlert *other = &state->fraud_alerts[i];
+                if (!strcmp(other->username, alert->username) && other->hold_applied && !other->reviewed) {
+                    open_hold_alert = 1;
+                    break;
+                }
+            }
+            if (!open_hold_alert) snprintf(account->status, sizeof(account->status), "ACTIVE");
+        }
+        response_ok(response, "Fraud alert review saved.");
+        response_line(response, "DATA|%s|%s\n", alert->id,
+                      account ? account->status : "NO_ACCOUNT");
         return;
     }
 
@@ -1298,7 +1521,13 @@ static int authenticated_operation(BankState *state, void *argument) {
     if (!user || !user->active) { response_error(response, "This user is inactive."); return 0; }
     if (role_is(user, "customer")) {
         BankAccount *account = find_account(state, user->username);
-        if (!account || strcmp(account->status, "ACTIVE")) { response_error(response, "This account is inactive. Contact a bank manager."); return 0; }
+        if (!account) { response_error(response, "Customer account was not found."); return 0; }
+        if (!strcmp(account->status, "FRAUD_HOLD") && strcmp(context->fields[0], "LOGOUT")) {
+            response_error(response, "This account is temporarily held for administrator review."); return 0;
+        }
+        if (strcmp(account->status, "ACTIVE") && strcmp(context->fields[0], "LOGOUT")) {
+            response_error(response, "This account is inactive. Contact a bank manager."); return 0;
+        }
     }
     record->last_seen = now;
     /* LOGOUT is handled here because it changes session state, not bank data. */
@@ -1342,7 +1571,12 @@ void bank_execute(BankStore *store, BankSession *session, const char *request, B
         return;
     }
     /* The pointers in fields refer into copy and are valid through this call only. */
-    RequestContext context = { .fields = fields, .count = (size_t)count, .session = session, .response = response };
+    RequestContext context = {
+        .fields = fields,
+        .count = (size_t)count,
+        .session = session,
+        .response = response
+    };
     if (!strcmp(fields[0], "LOGIN")) run_locked(store, login_operation, &context, response);
     else run_locked(store, authenticated_operation, &context, response);
     free(copy);

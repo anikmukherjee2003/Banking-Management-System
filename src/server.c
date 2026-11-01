@@ -78,22 +78,23 @@ static ssize_t receive_line(int fd, char *buffer, size_t capacity) {
     return (ssize_t)used;
 }
 
-static void *client_thread(void *argument) {
+static void *client_thread(void *argument) {//the actual call was pthread_create(&thread, NULL, client_thread, connection); in worker_loop & connection is a struct which has socket_fd and store. So the argument is a pointer to ClientConnection struct.
     /*
      * Thread entry point. The worker allocated ClientConnection before calling
      * pthread_create(); this thread copies its values and frees that allocation.
      * It then handles many sequential requests on one socket until EOF/error.
      */
     ClientConnection *connection = argument;
-    int fd = connection->socket_fd;
+    int fd = connection->socket_fd;//this fd is client_fd which is returned by accept() in worker_loop. So this fd is the socket for the connected client.
     BankStore *store = connection->store;
     free(connection);
     /* Authentication starts empty and is established only by a successful LOGIN. */
-    BankSession session = {0};
+    BankSession session = {0}; // LOGIN fills in the authenticated username and token; the password is not stored here.
     char request[BANK_REQUEST_MAX];
     for (;;) {
         /* Request framing is one line at a time; each line gets one response frame. */
         ssize_t count = receive_line(fd, request, sizeof(request));
+        //the client receives a complete command line TRANSFER|bob|250.00\n & populate the request buffer.
         if (count == -2) {
             static const char too_large[] = "ERROR|Request is too large.\nEND\n";
             send_all(fd, too_large, sizeof(too_large) - 1);
@@ -101,7 +102,7 @@ static void *client_thread(void *argument) {
         }
         if (count <= 0) break;
         BankResponse response = {0};
-        bank_execute(store, &session, request, &response);
+        bank_execute(store, &session, request, &response);//This is where server.c hands responsibility to store.c.
         if (!response.length || send_all(fd, response.data, response.length) != 0) break;
     }
     /* Also clean up on abrupt disconnect, not just an explicit LOGOUT command. */
@@ -143,7 +144,12 @@ static void worker_loop(int listener_fd, BankStore *store) {
             close(client_fd);
             continue;
         }
+        //no pthread_join() here because we want the thread to run independently
         pthread_detach(thread);
+        //what worker_loop(argument) does step by step in short, Step 1: The worker process enters an infinite loop where it waits for incoming client connections using the accept() function on the inherited listener socket (listener_fd). When a new client connection is accepted, it creates a new socket (client_fd) for that specific client.
+        //Step 2: The worker process allocates memory for a ClientConnection structure, which holds the client socket file descriptor (client_fd) and a pointer to the shared BankStore (store). This structure is used to pass information to the client_thread function.
+        //Step 3: The worker process creates a new thread (pthread) using pthread_create(), passing the client_thread function and the ClientConnection structure as arguments. The new thread will handle communication with the connected client.
+        //Step 4: The worker process detaches the newly created thread using pthread_detach(), allowing it to run independently without requiring the worker process to wait for its completion. The worker process then continues to listen for new client connections in the loop.
     }
 }
 

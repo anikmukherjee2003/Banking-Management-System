@@ -48,6 +48,12 @@ To connect more clients, run the client command in additional terminals. In a ro
 3. Open another client as `employee`. Choose **4. View assigned loan applications**, then **5. Approve or reject a loan**. Enter the loan ID and `approve`.
 4. Sign in as `alice` again and choose **1. View account balance** or **8. Transaction history**. The approved amount appears as a `LOAN_DISBURSEMENT` entry.
 
+## Try fraud detection and alert review
+
+Fraud checks run synchronously with transfer and withdrawal requests. A transfer of Rs 100,000 or more is blocked and places the sender on hold. The third outgoing transfer within five minutes is also blocked. Three insufficient-funds transfer or withdrawal attempts within ten minutes create a hold. Failed-attempt alerts are recorded as they happen.
+
+Sign in as `admin`, choose **4. Review fraud alerts**, then choose **5. Resolve fraud alert** and enter the alert ID. The customer's account returns to `ACTIVE` after every hold-causing alert for that customer has been reviewed. Alert records remain in the database after review. To trigger the large-transfer rule, create a recipient account and try a transfer of Rs 100,000 or more. To trigger the failed-attempt rule, try to withdraw more than Alice's balance three times. To trigger the burst rule, make three small successful transfers to the recipient within five minutes.
+
 ## Check account creation and concurrency in WSL
 
 Use the administrator's **1. Create user account** option to create customer, employee, manager, and administrator users directly. Employees can also create customers from **1. Open customer account**. The administrator's **3. Manage user role** option can change an existing user's role.
@@ -90,7 +96,8 @@ To add a banking operation, add its menu and request in `src/client.c`, handle t
 - **Customer:** view balance, deposit, withdraw, transfer to another active customer, apply for a loan, change password, submit feedback, and view transaction history.
 - **Employee:** open customer accounts, update customer contact details, close empty customer accounts, view assigned loan applications, approve or reject assigned applications, and view customer passbooks. Closure requires a zero balance and no loan application under review.
 - **Manager:** view unassigned loan applications, assign applications to active employees, activate or deactivate customer accounts, and review feedback.
-- **Administrator:** create customer, employee, manager, or administrator accounts; modify customer or employee details; and manage user roles. Employees can also open customer accounts.
+- **Administrator:** create customer, employee, manager, or administrator accounts; modify customer or employee details; manage user roles; and review or resolve fraud alerts. Employees can also open customer accounts.
+- **Fraud review:** transfer value, transfer bursts, and repeated insufficient-funds attempts create persistent alerts; suspicious transfers are blocked and the sender is held until an administrator reviews the alert.
 - Server-side role checks protect every operation; menus do not grant permissions by themselves.
 
 ## Implementation map
